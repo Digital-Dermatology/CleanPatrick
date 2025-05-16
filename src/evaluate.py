@@ -17,25 +17,137 @@ from src.detectors.off_topic_samples.pyod_wrapper import PyODWrapper
 from src.detectors.selfclean_detector import SelfCleanDetector
 
 
-def get_sorted_labels(label_matrix, distance_matrix):
-    # Get the lower triangular indices (excluding the diagonal).
+def get_sorted_labels(
+    label_matrix: np.ndarray, distance_matrix: np.ndarray
+) -> np.ndarray:
+    """
+    Given a label and distance matrix, returns sorted labels based on ascending distances.
+    """
     tril_indices = np.tril_indices_from(label_matrix, k=-1)
-    # Extract the lower triangular portions from both matrices.
-    labels_lower = label_matrix[tril_indices]
-    distances_lower = distance_matrix[tril_indices]
-    # Filter out entries where the label is np.inf (i.e. non-annotated pairs).
-    valid_mask = ~np.isnan(labels_lower)
-    filtered_labels = labels_lower[valid_mask]
-    filtered_distances = distances_lower[valid_mask]
-    # Get the indices that would sort the distances in ascending order.
-    sorted_order = np.argsort(filtered_distances)
-    # Reorder the labels by the sorted order of their corresponding distances.
-    sorted_labels = filtered_labels[sorted_order]
-    return sorted_labels
+    labels = label_matrix[tril_indices]
+    distances = distance_matrix[tril_indices]
+    mask = ~np.isnan(labels)
+    return labels[mask][np.argsort(distances[mask])]
 
 
-if __name__ == "__main__":
-    # load the dataset to evaluate on
+def evaluate_off_topic(dataset):
+    """
+    Evaluate off-topic sample detection for various methods.
+    Returns a dict mapping method names to their truth arrays.
+    """
+    # Ground truth indices
+    ot_samples = set(dataset.df_ot.loc[dataset.df_ot["label"] == 1].index)
+    total = len(dataset)
+    pct = len(ot_samples) / total * 100
+    logger.info(
+        f"Off-Topic: {len(ot_samples)}/{total} ({pct:.2f}%) samples are off-topic"
+    )
+
+    results = {}
+    # SelfClean
+    issues = SelfCleanDetector.get_ranking(
+        dataset=dataset, ckp_path="models/Fitzpatrick17k/DINO/checkpoint-epoch500.pth"
+    )
+    preds = np.array(
+        [
+            1 if idx in ot_samples else 0
+            for idx in issues["off_topic_samples"]["indices"]
+        ]
+    )
+    results["SelfClean"] = preds
+
+    # PyOD methods
+    for name, model in [
+        ("ECOD", ECOD),
+        ("IForest", IForest),
+        ("KNN", KNN),
+        ("HBOS", HBOS),
+    ]:
+        ranking = PyODWrapper.get_ranking(irrelevant_detector=model, dataset=dataset)
+        preds = np.array([1 if idx in ot_samples else 0 for idx in ranking])
+        results[name] = preds
+
+    _print_scores(results)
+    return results
+
+
+def evaluate_near_duplicates(dataset):
+    """
+    Evaluate near-duplicate detection for various methods.
+    """
+    # SelfClean distances
+    issues = SelfCleanDetector.get_ranking(
+        dataset=dataset, ckp_path="models/Fitzpatrick17k/DINO/checkpoint-epoch500.pth"
+    )
+    nd_self = get_sorted_labels(
+        dataset.nd_matrix.values, issues["near_duplicate_matrix"]
+    )
+
+    dataset.transform = None  # disable transforms for hash/ssim
+    results = {"SelfClean": nd_self}
+    for method in ["phash", "ssim"]:
+        dist_mat = np.load(f"assets/results/{method}_matrix.npy")
+        nd_vals = get_sorted_labels(dataset.nd_matrix.values, dist_mat)
+        results[method.upper()] = nd_vals
+    dataset.transform = transforms.Compose(
+        [
+            transforms.Resize((256, 256)),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        ]
+    )
+
+    _print_scores(results)
+    return results
+
+
+def evaluate_label_errors(dataset):
+    """
+    Evaluate label error detection for various methods.
+    """
+    lbl_errs = set(dataset.df_lb.loc[dataset.df_lb["label"] == 1].index)
+    total = len(dataset)
+    pct = len(lbl_errs) / total * 100
+    logger.info(
+        f"Label Errors: {len(lbl_errs)}/{total} ({pct:.2f}%) samples are mislabeled"
+    )
+
+    results = {}
+    # SelfClean
+    issues = SelfCleanDetector.get_ranking(
+        dataset=dataset, ckp_path="models/Fitzpatrick17k/DINO/checkpoint-epoch500.pth"
+    )
+    preds = np.array(
+        [1 if idx in lbl_errs else 0 for idx in issues["label_errors"]["indices"]]
+    )
+    results["SelfClean"] = preds
+
+    # Other detectors
+    for Detector in [ConfidentLearningDetector, NoiseRankDetector]:
+        ranking = Detector.get_ranking(dataset=copy.deepcopy(dataset))
+        ids = [item[1] if isinstance(item, tuple) else item for item in ranking]
+        preds = np.array([1 if idx in lbl_errs else 0 for idx in ids])
+        results[Detector.__name__] = preds
+
+    _print_scores(results)
+    return results
+
+
+def _print_scores(results: dict):
+    """
+    Helper to print scores for each method using calculate_scores_from_ranking.
+    """
+    for name, truth in results.items():
+        logger.info(f"Method: {name}")
+        calculate_scores_from_ranking(
+            ranking=truth, log_wandb=False, show_plots=False, show_scores=True
+        )
+    logger.info("-" * 50)
+
+
+def main():
+    # Setup
     transform = transforms.Compose(
         [
             transforms.Resize((256, 256)),
@@ -45,119 +157,20 @@ if __name__ == "__main__":
         ]
     )
     data_path = Path("data/")
-    dataset_path = data_path / "fitzpatrick17k/"
-    csv_path = dataset_path / "fitzpatrick17k.csv"
     dataset = CleanPatrick(
         cleanpatrick_dataset_dir=data_path / "CleanPatrick",
-        fitzpatrick_dataset_dir=dataset_path,
-        fitzpatrick_csv_file=csv_path,
+        fitzpatrick_dataset_dir=data_path / "fitzpatrick17k",
+        fitzpatrick_csv_file=data_path / "fitzpatrick17k/fitzpatrick17k.csv",
         transform=transform,
         return_path=True,
     )
 
-    # run SelfClean since it can detect all issue types
-    issues = SelfCleanDetector.get_ranking(
-        dataset=dataset,
-        ckp_path="models/Fitzpatrick17k/DINO/checkpoint-epoch500.pth",
-    )
-    pred_selfclean_ot_indices = issues["off_topic_samples"]["indices"]
-    pred_selfclean_lbl_indices = issues["label_errors"]["indices"]
-    pred_selfclean_nd_matrix = issues["near_duplicate_matrix"]
+    logger.info("Starting Benchmark Evaluation")
+    evaluate_off_topic(dataset)
+    evaluate_near_duplicates(dataset)
+    evaluate_label_errors(dataset)
+    logger.info("Benchmark Evaluation Complete")
 
-    # --- Off-Topic Samples ---
-    # create ground truth metadata
-    ot_samples = list(dataset.df_ot[dataset.df_ot["label"] == 1].index)
-    # calculate the % of off-topic samples in the dataset
-    print(f"% of off-topic samples: {(len(ot_samples) / len(dataset)) * 100}")
 
-    l_truths = []
-    # eval SelfClean
-    truth = [1 if int(x) in ot_samples else 0 for x in pred_selfclean_ot_indices]
-    truth = np.asarray(truth)
-    l_truths.append(("SelfClean", truth))
-
-    for name_detector, irr_detector in [
-        ("ECOD", ECOD),
-        ("IForest", IForest),
-        ("KNN", KNN),
-        ("HBOS", HBOS),
-    ]:
-        ranking = PyODWrapper.get_ranking(
-            irrelevant_detector=irr_detector,
-            dataset=dataset,
-        )
-        ranking_target = [1 if x in ot_samples else 0 for x in ranking]
-        ranking_target = np.asarray(ranking_target)
-        l_truths.append((name_detector, ranking_target))
-
-    for name, truth in l_truths:
-        logger.info(f"Method: {name.upper()}")
-        calculate_scores_from_ranking(
-            ranking=truth,
-            log_wandb=False,
-            show_plots=False,
-            show_scores=True,
-        )
-    logger.info("-" * 40)
-    # -----------------------
-
-    # --- Near Duplicates ---
-    l_truths = []
-    nd_truth = get_sorted_labels(dataset.nd_matrix.values, pred_selfclean_nd_matrix)
-    nd_truth = np.asarray(nd_truth)
-    l_truths.append(("SelfClean", nd_truth))
-    # eval competitors
-    dataset.transform = None
-    for dup_detector in ["phash", "ssim"]:
-        dist_mat = np.load(f"assets/results/{dup_detector}_matrix.npy")
-        nd_truth = get_sorted_labels(dataset.nd_matrix.values, dist_mat)
-        nd_truth = np.asarray(nd_truth)
-        l_truths.append((dup_detector, nd_truth))
-    dataset.transform = transform
-    for name, truth in l_truths:
-        logger.info(f"Method: {name.upper()}")
-        calculate_scores_from_ranking(
-            ranking=truth,
-            log_wandb=False,
-            show_plots=False,
-            show_scores=True,
-        )
-    logger.info("-" * 40)
-    # -----------------------
-
-    # --- Label Errors ---
-    # create ground truth metadata
-    lbl_errs = list(dataset.df_lb[dataset.df_lb["label"] == 1].index)
-    # calculate the % of label errors in the dataset
-    print(f"% of label errors: {(len(lbl_errs) / len(dataset)) * 100}")
-
-    l_truths = []
-    # eval SelfClean
-    truth = [1 if int(x) in lbl_errs else 0 for x in pred_selfclean_lbl_indices]
-    truth = np.asarray(truth)
-    l_truths.append(("SelfClean", truth))
-
-    # eval competitors
-    for lbl_detector in [
-        ConfidentLearningDetector,
-        NoiseRankDetector,
-    ]:
-        ranking = lbl_detector.get_ranking(
-            dataset=copy.deepcopy(dataset),
-        )
-        if type(ranking[0]) is tuple:
-            truth = [1 if int(x[1]) in lbl_errs else 0 for x in ranking]
-        else:
-            truth = [1 if int(x) in lbl_errs else 0 for x in ranking]
-        truth = np.asarray(truth)
-        l_truths.append((str(lbl_detector), truth))
-
-    for name, truth in l_truths:
-        logger.info(f"Method: {name.upper()}")
-        calculate_scores_from_ranking(
-            ranking=truth,
-            log_wandb=False,
-            show_plots=False,
-            show_scores=True,
-        )
-    # -----------------------
+if __name__ == "__main__":
+    main()

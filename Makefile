@@ -8,7 +8,7 @@ include *.mk
 ###########################
 # VARIABLES
 ###########################
-PROJECTNAME := CleanPatrick
+PROJECTNAME := cleanpatrick
 GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD | tr / _)
 PROJECT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/)
 
