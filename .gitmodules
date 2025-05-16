@@ -1,0 +1,6 @@
+[submodule "src/detectors/selfclean"]
+	path = src/detectors/selfclean
+	url = https://github.com/Digital-Dermatology/selfclean.git
+[submodule "src/core"]
+	path = src/core
+	url = https://github.com/Digital-Dermatology/core.git
